@@ -93,6 +93,8 @@ struct fpc1020_data {
 	bool prepared;
 	atomic_t wakeup_enabled; /* Used both in ISR and non-ISR */
 	struct notifier_block fb_notifier;
+    bool fb_black;
+    bool proximity_state; /* 0:far 1:near */
 };
 
 static int vreg_setup(struct fpc1020_data *fpc1020, const char *name,
@@ -159,6 +161,27 @@ found:
 	}
 
 	return rc;
+}
+
+static void config_irq(struct fpc1020_data *fpc1020, bool enabled)
+{
+    static bool irq_enabled = true;
+    
+    mutex_lock(&fpc1020->lock);
+    if (enabled != irq_enabled) {
+        if (enabled)
+        enable_irq(gpio_to_irq(fpc1020->irq_gpio));
+        else
+        disable_irq(gpio_to_irq(fpc1020->irq_gpio));
+        
+        dev_info(fpc1020->dev, "%s: %s fpc irq ---\n", __func__,
+                 enabled ?  "enable" : "disable");
+        irq_enabled = enabled;
+    } else {
+        dev_info(fpc1020->dev, "%s: dual config irq status: %s\n", __func__,
+                 enabled ?  "true" : "false");
+    }
+    mutex_unlock(&fpc1020->lock);
 }
 
 /**
@@ -280,6 +303,32 @@ static ssize_t irq_enable_set(struct device *dev,
 	return rc ? rc : count;
 }
 static DEVICE_ATTR(irq_enable, S_IWUSR | S_IRUSR | S_IRGRP | S_IWGRP , NULL, irq_enable_set);
+
+static ssize_t proximity_state_set(struct device *dev,
+                                   struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct fpc1020_data *fpc1020 = dev_get_drvdata(dev);
+    int rc, val;
+    
+    rc = kstrtoint(buf, 10, &val);
+    if (rc)
+    return -EINVAL;
+    
+    fpc1020->proximity_state = !!val;
+    
+    if (fpc1020->fb_black) {
+        if (fpc1020->proximity_state) {
+            /* Disable IRQ when screen is off and proximity sensor is covered */
+            config_irq(fpc1020, false);
+        } else {
+            /* Enable IRQ when screen is off and proximity sensor is uncovered */
+            config_irq(fpc1020, true);
+        }
+    }
+    
+    return count;
+}
+static DEVICE_ATTR(proximity_state, S_IWUSR, NULL, proximity_state_set);
 
 static int hw_reset(struct fpc1020_data *fpc1020)
 {
@@ -473,6 +522,7 @@ static struct attribute *attributes[] = {
 	&dev_attr_clk_enable.attr,
  	&dev_attr_irq_enable.attr,
 	&dev_attr_irq.attr,
+    &dev_attr_proximity_state.attr,
 	NULL
 };
 
@@ -524,6 +574,8 @@ static int fpc_fb_notif_callback(struct notifier_block *nb,
 {
 	struct fpc1020_data *fpc1020 = container_of(nb, struct fpc1020_data,
 			fb_notifier);
+    struct fb_event *evdata = data;
+    int *blank;
 
 	if (!fpc1020)
 		return 0;
@@ -533,6 +585,27 @@ static int fpc_fb_notif_callback(struct notifier_block *nb,
 
 	pr_debug("hml [info] %s value = %d\n", __func__, (int)val);
 
+    if (evdata && evdata->data && val == MSM_DRM_EVENT_BLANK) {
+        blank = evdata->data;
+        if (*blank == MSM_DRM_BLANK_UNBLANK) {
+            fpc1020->fb_black = false;
+            /* Unconditionally enable IRQ when screen turns on */
+            config_irq(fpc1020, true);
+        }
+    }
+    else if (evdata && evdata->data && val == MSM_DRM_EARLY_EVENT_BLANK) {
+        blank = evdata->data;
+        if (*blank == MSM_DRM_BLANK_POWERDOWN) {
+            fpc1020->fb_black = true;
+            /*
+             * Disable IRQ when screen turns off,
+             * if proximity sensor is covered
+             */
+            if (fpc1020->proximity_state) {
+                config_irq(fpc1020, false);
+            }
+        }
+    }
 	return NOTIFY_OK;
 }
 
@@ -654,6 +727,7 @@ static int fpc1020_probe(struct platform_device *pdev)
 	rc = hw_reset(fpc1020);
 
 	dev_info(dev, "%s: ok\n", __func__);
+    fpc1020->fb_black = false;
 	fpc1020->fb_notifier = fpc_notif_block;
 	msm_drm_register_client(&fpc1020->fb_notifier);
 
