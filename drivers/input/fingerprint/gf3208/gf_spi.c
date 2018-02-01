@@ -649,6 +649,9 @@ static int goodix_fb_state_chg_callback(struct notifier_block *nb,
 	if (evdata && evdata->data && val == MSM_DRM_EVENT_BLANK && gf_dev) {
 		blank = evdata->data;
 		if (gf_dev->device_available == 1 && *blank == MSM_DRM_BLANK_UNBLANK) {
+            gf_dev->fb_black = 0;
+            /* Unconditionally enable IRQ when screen turns on */
+            gf_enable_irq(gf_dev);
 #if defined(GF_NETLINK_ENABLE)
 				msg = GF_NET_EVENT_FB_UNBLACK;
 				sendnlmsg(&msg);
@@ -661,6 +664,11 @@ static int goodix_fb_state_chg_callback(struct notifier_block *nb,
 	}else if(evdata && evdata->data && val == MSM_DRM_EARLY_EVENT_BLANK && gf_dev){
 		blank = evdata->data;
 			if (gf_dev->device_available == 1 && *blank == MSM_DRM_BLANK_POWERDOWN) {
+                gf_dev->fb_black = 1;
+                /* Disable IRQ when screen turns off,
+                 * only if proximity sensor is covered */
+                if (gf_dev->proximity_state)
+                gf_disable_irq(gf_dev);
 #if defined(GF_NETLINK_ENABLE)
 				msg = GF_NET_EVENT_FB_BLACK;
 				sendnlmsg(&msg);
@@ -676,6 +684,41 @@ static int goodix_fb_state_chg_callback(struct notifier_block *nb,
 
 static struct notifier_block goodix_noti_block = {
 	.notifier_call = goodix_fb_state_chg_callback,
+};
+
+static ssize_t proximity_state_set(struct device *dev,
+                                   struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct gf_dev *gf_dev = dev_get_drvdata(dev);
+    int rc, val;
+    
+    rc = kstrtoint(buf, 10, &val);
+    if (rc)
+    return -EINVAL;
+    
+    gf_dev->proximity_state = !!val;
+    
+    if (gf_dev->fb_black) {
+        if (gf_dev->proximity_state) {
+            /* Disable IRQ when screen is off and proximity sensor is covered */
+            gf_disable_irq(gf_dev);
+        } else {
+            /* Enable IRQ when screen is off and proximity sensor is uncovered */
+            gf_enable_irq(gf_dev);
+        }
+    }
+    
+    return count;
+}
+static DEVICE_ATTR(proximity_state, S_IWUSR, NULL, proximity_state_set);
+
+static struct attribute *attrs[] = {
+    &dev_attr_proximity_state.attr,
+    NULL
+};
+
+static const struct attribute_group attr_group = {
+    .attrs = attrs,
 };
 
 static struct class *gf_class;
@@ -701,6 +744,7 @@ static int gf_probe(struct platform_device *pdev)
 	gf_dev->reset_gpio = -EINVAL;
 	gf_dev->pwr_gpio = -EINVAL;
 	gf_dev->device_available = 0;
+    gf_dev->fb_black = 0;
 
 	/* If we can allocate a minor number, hook up this device.
 	 * Reusing minors is fine so long as udev or mdev is working.
@@ -764,12 +808,22 @@ static int gf_probe(struct platform_device *pdev)
 	gf_dev->notifier = goodix_noti_block;
 	msm_drm_register_client(&gf_dev->notifier);
 
+    dev_set_drvdata(&gf_dev->spi->dev, gf_dev);
+    
+    status = sysfs_create_group(&gf_dev->spi->dev.kobj, &attr_group);
+    if (status) {
+        pr_err("%s: Failed to create sysfs\n", __func__);
+        goto error_sysfs;
+    }
+
 	wakeup_source_init(&fp_ws, "fp_ws");
 
 	pr_info("version V%d.%d.%02d\n", VER_MAJOR, VER_MINOR, PATCH_LEVEL);
 
 	return status;
 
+error_sysfs:
+    sysfs_remove_group(&gf_dev->spi->dev.kobj, &attr_group);
 #ifdef AP_CONTROL_CLK
 gfspi_probe_clk_enable_failed:
 	gfspi_ioctl_clk_uninit(gf_dev);
